@@ -34,6 +34,7 @@ Dépendances :  pip install numpy matplotlib
 """
 
 import math
+from collections import deque
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -80,6 +81,10 @@ IB = 2 * SN / (3 * VB)            # courant de base (crête)
 ZB = VB / IB                      # impédance de base
 F_BASE = 50.0                     # fréquence nominale du réseau (Hz)
 W_BASE = 2 * math.pi * F_BASE
+
+# Historique à pleine cadence pour l'analyse spectrale (FFT)
+FFT_MAX_CYCLES = 20
+FFT_MAXLEN = int(FFT_MAX_CYCLES / F_BASE / DT)
 
 XF_PU = 0.15                      # inductance du filtre côté onduleur (pu)
 LF = XF_PU * ZB / W_BASE
@@ -413,6 +418,9 @@ class App:
         self.x = np.linspace(-self.n_pts * self.dec * DT, 0, self.n_pts)
         self.plot_axes = []
         self.paused = False
+        self.fft_win = None
+        self.fft_p = deque(maxlen=FFT_MAXLEN)     # sortie MLI (bras A), pleine cadence
+        self.fft_v = deque(maxlen=FFT_MAXLEN)     # tension au PCC (sortie du filtre)
 
         # variables de contrôle
         self.v_vac = tk.DoubleVar(value=325.0)
@@ -870,6 +878,7 @@ class App:
 
         self.btn_pause = ttk.Button(p, text="⏸ Pause", command=self.toggle_pause)
         self.btn_pause.pack(fill=tk.X, pady=1)
+        ttk.Button(p, text="📊 Spectre (FFT)", command=self.open_fft).pack(fill=tk.X, pady=1)
         ttk.Button(p, text="↺ Réinitialiser la PLL",
                    command=self.model.reset_pll).pack(fill=tk.X, pady=1)
         ttk.Button(p, text="⟲ Resynchroniser tout",
@@ -904,6 +913,148 @@ class App:
         self.buf = np.repeat(self.buf[:, -1:], n, axis=1)
         for ln, i in self.line_idx:
             ln.set_data(self.x, self.buf[i])
+
+    # ==================================================================
+    # Fenêtre d'analyse spectrale (FFT)
+    # ==================================================================
+    def open_fft(self):
+        """Ouvre (ou ramène au premier plan) la fenêtre des spectres."""
+        if self.fft_win is not None:
+            try:
+                self.fft_win.lift()
+                return
+            except tk.TclError:
+                self.fft_win = None
+        win = tk.Toplevel(self.root)
+        win.title("Spectre : sortie MLI (bras A) et sortie du filtre (v_pcc)")
+        win.geometry("940x620")
+        win.protocol("WM_DELETE_WINDOW", self._fft_close)
+        self.fft_win = win
+
+        self.fft_db = tk.BooleanVar(value=True)
+        self.fft_log = tk.BooleanVar(value=False)
+        self.fft_hann = tk.BooleanVar(value=True)
+        self.fft_cycles = tk.IntVar(value=5)
+        self.fft_pad = tk.IntVar(value=8)
+
+        bar = ttk.Frame(win, padding=4)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Checkbutton(bar, text="Échelle dB", variable=self.fft_db).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(bar, text="Fréquence log", variable=self.fft_log).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(bar, text="Fenêtre de Hann", variable=self.fft_hann).pack(side=tk.LEFT, padx=4)
+        ttk.Label(bar, text="Périodes réseau analysées :").pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Spinbox(bar, values=(1, 2, 5, 10, 20), width=4,
+                    textvariable=self.fft_cycles).pack(side=tk.LEFT)
+        ttk.Label(bar, text="Zéro-padding ×").pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Spinbox(bar, values=(1, 2, 4, 8, 16, 32), width=4,
+                    textvariable=self.fft_pad).pack(side=tk.LEFT)
+        self.fft_info = ttk.Label(bar, text="", foreground="gray")
+        self.fft_info.pack(side=tk.RIGHT, padx=6)
+
+        fig = Figure(figsize=(9, 5.4), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.grid(alpha=0.35, which="both")
+        ax.set_xlabel("Fréquence (Hz)")
+        self.fft_l1, = ax.plot([1.0], [0.0], color=C_PWM, lw=0.9, label="Sortie MLI (bras A)")
+        self.fft_l2, = ax.plot([1.0], [0.0], color=C_OUT, lw=1.7, label="Sortie du filtre (v_pcc)")
+        self.fft_vg = ax.axvline(1.0, color=C_GRID, ls=":", lw=1.2, label="f réseau")
+        self.fft_vc = ax.axvline(1.0, color=C_MOD, ls="--", lw=1.0, label="f MLI")
+        self.fft_vf = ax.axvline(1.0, color=C_OUT, ls="-.", lw=1.0, label="f coupure filtre")
+        ax.legend(loc="upper right", fontsize=8)
+        self.fft_txt = ax.text(0.99, 0.62, "", transform=ax.transAxes, ha="right",
+                               va="top", fontsize=8,
+                               bbox=dict(fc="white", ec="0.7", alpha=0.9))
+        fig.subplots_adjust(left=0.09, right=0.98, top=0.96, bottom=0.10)
+        self.fft_ax = ax
+        self.fft_canvas = FigureCanvasTkAgg(fig, master=win)
+        self.fft_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self._fft_refresh()
+
+    def _fft_close(self):
+        win, self.fft_win = self.fft_win, None
+        if win is not None:
+            win.destroy()
+
+    def _fft_refresh(self):
+        win = self.fft_win
+        if win is None:
+            return
+        try:
+            cycles = max(1, int(self.fft_cycles.get()))
+            pad = max(1, int(self.fft_pad.get()))
+            freq = self.v_freq.get()
+            fcar = 10 ** self.v_fcar.get()
+            fc = self.v_fc.get()
+            db = self.fft_db.get()
+            logf = self.fft_log.get()
+            hann = self.fft_hann.get()
+        except (tk.TclError, ValueError):          # saisie en cours
+            win.after(300, self._fft_refresh)
+            return
+
+        n_want = int(round(cycles / max(freq, 1e-3) / DT))
+        n_have = len(self.fft_p)
+        n = min(n_want, n_have)
+        ax = self.fft_ax
+        if n >= 64:
+            # signaux à pleine cadence (non décimés) : pas de repliement lié à l'affichage
+            x1 = np.fromiter(self.fft_p, float, n_have)[-n:]
+            x2 = np.fromiter(self.fft_v, float, n_have)[-n:]
+            w = np.hanning(n) if hann else np.ones(n)
+            nfft = int(min(n * pad, 1 << 20))               # zéro-padding
+            f = np.fft.rfftfreq(nfft, DT)
+            norm = 2.0 / w.sum()                            # amplitude crête
+            a1 = np.abs(np.fft.rfft(x1 * w, nfft)) * norm
+            a2 = np.abs(np.fft.rfft(x2 * w, nfft)) * norm
+
+            def peak(a, f0, rel=0.1):
+                msk = (f >= f0 * (1 - rel)) & (f <= f0 * (1 + rel))
+                return float(a[msk].max()) if msk.any() else 0.0
+
+            a1f, a2f = peak(a1, freq), peak(a2, freq)
+            a1c, a2c = peak(a1, fcar), peak(a2, fcar)
+
+            xmax = min(f[-1], 4.0 * fcar)
+            keep = (f > 0) & (f <= xmax)
+            fp, p1, p2 = f[keep], a1[keep], a2[keep]
+            if len(fp) > 20000:                             # allège le tracé en gardant les crêtes
+                k = len(fp) // 20000
+                m = len(fp) // k
+                fp = fp[:m * k].reshape(m, k)[:, 0]
+                p1 = p1[:m * k].reshape(m, k).max(axis=1)
+                p2 = p2[:m * k].reshape(m, k).max(axis=1)
+            if db:
+                p1 = 20 * np.log10(np.maximum(p1, 1e-6))
+                p2 = 20 * np.log10(np.maximum(p2, 1e-6))
+            self.fft_l1.set_data(fp, p1)
+            self.fft_l2.set_data(fp, p2)
+            for ln, x in ((self.fft_vg, freq), (self.fft_vc, fcar), (self.fft_vf, fc)):
+                ln.set_xdata([x, x])
+
+            ax.set_xscale("log" if logf else "linear")
+            ax.set_xlim((max(freq / 2.0, f[1]) if logf else 0.0), xmax)
+            top = float(max(p1.max(), p2.max()))
+            if db:
+                ax.set_ylim(top - 110.0, top + 8.0)
+                ax.set_ylabel("Amplitude crête (dBV)")
+            else:
+                ax.set_ylim(0.0, top * 1.1)
+                ax.set_ylabel("Amplitude crête (V)")
+
+            att = 20 * math.log10(a2c / a1c) if a1c > 0 and a2c > 0 else float("nan")
+            self.fft_txt.set_text(
+                f"fondamental ({freq:.1f} Hz) : MLI {a1f:.0f} V | filtre {a2f:.0f} V\n"
+                f"à f_MLI ({fcar:.0f} Hz) : MLI {a1c:.1f} V | filtre {a2c:.2f} V\n"
+                f"atténuation du filtre à f_MLI : {att:.1f} dB")
+            info = (f"Δf = 1/T = {1.0 / (n * DT):.3g} Hz | pas avec zéro-padding "
+                    f"{1.0 / (nfft * DT):.3g} Hz | fs = {1.0 / DT / 1e3:.0f} kHz | {n} éch.")
+            if n < n_want:
+                info += f" | historique : {n * DT * 1e3:.0f}/{n_want * DT * 1e3:.0f} ms"
+            self.fft_info.config(text=info)
+            self.fft_canvas.draw_idle()
+        else:
+            self.fft_info.config(text="pas encore assez de données simulées…")
+        win.after(300, self._fft_refresh)
 
     # ==================================================================
     # Boucle d'animation
@@ -950,10 +1101,14 @@ class App:
                 self.prefill = False
             samples = []
             step = m.step
+            fp_add = self.fft_p.append
+            fv_add = self.fft_v.append
             cnt = self.cnt
             t0 = time.perf_counter()
             for i in range(n_steps):
                 out = step(vac, phi, freq, harm, vdc, fcar)
+                fp_add(out[5])
+                fv_add(out[6])
                 cnt += 1
                 if cnt >= dec:
                     cnt = 0
